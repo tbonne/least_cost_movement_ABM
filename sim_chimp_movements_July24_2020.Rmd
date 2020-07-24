@@ -376,8 +376,6 @@ calculate.distance.betw.points <- function(x,p2){
 
 Choose parameters for the ABM (all parameters for the ABM will be placed here).
 ```{r}
-#df.start.end.coords <- read.csv("StartEnd_Coords.csv")
-#df.start.end.coords<-df.start.end.coords[,1:6]
 
 min.threshold = 45     #when has the agent reached the end point
 sim.replicates = 100   #How many simulated replicates to run
