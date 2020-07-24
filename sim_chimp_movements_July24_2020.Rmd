@@ -1,0 +1,449 @@
+---
+title: "ABM for testing spatial memory"
+output: html_document
+---
+
+##Introduction:
+
+This is a notebook that will impliment an ABM to test assumptions of spatial memory on travel decisions. The code was writen for the paper "Chimpanzees use advanced spatial cognition to plan least-cost routes to out of sight goals" in Current Biology.
+
+Outline:
+
+0. get the data ready
+1. Define the ABM
+2. Simulate potential paths using the ABM
+3. Plot the results
+
+### 0) Get the data
+
+Load libraries
+```{r}
+library(gdistance)
+library(ggplot2)
+library(raster)
+library(rgdal)
+library(circular)
+library(movecost)
+library(dplyr)
+library(doParallel)
+```
+
+Add spatial data
+```{r}
+#DEM
+str_name <- "SRTM_UTM_Clip1.tif"
+r <- raster(str_name)
+crs(r)
+
+#Paths
+str_name_paths <- "EstabTrail_Cost21.tif"
+paths <- raster(str_name_paths)
+crs(paths)
+
+#start end points
+df.start.end.coords <- read.csv("StartEnd_Coords.csv")
+df.start.end.coords.starts <- df.start.end.coords %>% dplyr::select(Start.x, Start.y)
+df.start.end.coords.ends <- df.start.end.coords %>% dplyr::select(End.x, End.y)
+
+coordinates(df.start.end.coords.starts) <- ~ Start.x + Start.y
+coordinates(df.start.end.coords.ends) <- ~ End.x + End.y
+
+crs(df.start.end.coords.starts) <- "+proj=utm +zone=35 +south +datum=WGS84 +units=m +no_defs +ellps=WGS84 +towgs84=0,0,0"
+crs(df.start.end.coords.ends)   <- "+proj=utm +zone=35 +south +datum=WGS84 +units=m +no_defs +ellps=WGS84 +towgs84=0,0,0"
+
+#look at it all
+plot(r)
+plot(paths, add =T, alpha=0.35)
+points(df.start.end.coords.starts, col="red")
+points(df.start.end.coords.ends, col="blue")
+
+```
+
+
+### 2) Define the ABM
+
+```{r}
+###################
+#
+# Functions used to calculate costs
+#
+#################
+
+#function to convert cost values to conductance values
+cost.to.connectance <- function(x){
+  x.min=min(x)
+  x.max=max(x)
+  x2<-(1 - ((x - x.min) / (x.max - x.min))) * (x.max - x.min) + x.min
+  return(x2)
+}
+
+#function to convert cost values to conductance values: 1/cost
+cost.to.connectance.inv <- function(x){
+  return(1/x)
+}
+
+vert.factor.slope <- function(x){
+  
+  #convert to degrees
+  slope.degree = (x * 180) / (pi)
+  
+  vf <- ifelse(slope.degree < -15, 0.64, ifelse(slope.degree < 0,1+slope.degree*0.024 ,1+slope.degree*0.05 ))
+  
+return(vf)  
+}
+
+#mean difference between two cells
+cost.fun.path <- function(x){
+  return((x[2]+x[1])/2)
+}
+
+#difference between two cells
+heightDiff <- function(x){x[2] - x[1]}
+
+#cost distance function
+cost.distance <- function(x){
+  
+  #get difference in elevation
+  elevation.diff = x[2] - x[1]
+  tot.dist <- sqrt( (elevation.diff^2) + (30.88^2) )
+  return(tot.dist)
+  
+}
+
+
+
+###################
+#
+# Functions used to calculate transitions
+#
+#################
+
+
+#calculates the conductance surface
+getConductance_reduced <- function(start, end){
+  
+  #cut the rasters to smaller extent
+  min_x = min(start[1],end[1])
+  max_x = max(start[1],end[1])
+  min_y = min(start[2],end[2])
+  max_y = max(start[2],end[2])
+  
+  #set extent
+  r.temp <- raster()
+  bb <- extent(min_x - 2000,  max_x + 2000,min_y - 2000, max_y + 2000)
+  extent(r.temp) <- bb
+  res(r.temp) <-res(r)
+  projection(r.temp) <- crs("+proj=utm +zone=35 +south +datum=WGS84 +units=m +no_defs +ellps=WGS84 +towgs84=0,0,0")
+  
+  #clip
+  r.clip<-crop(x=r, y=r.temp)
+  paths.clip<-crop(x=paths, y=r.temp)#extent.temp
+  
+  ###################
+  #
+  # Elevation
+  #
+  #################
+  
+  hd <- transition(r.clip,heightDiff,8,symm=FALSE)
+  slope <- geoCorrection(hd, scl=FALSE)
+  adj <- adjacent(r.clip, cells=1:ncell(r.clip), pairs=TRUE, directions=8)
+  vf.cost <- slope
+  vf.cost[adj] <- vert.factor.slope(x=slope[adj])
+  vf.cost[adj] <- cost.to.connectance.inv(x=vf.cost[adj])
+  
+  #############
+  #
+  # Paths
+  #
+  #############
+  
+  #calculate mean conductance between cells based on path/non-path of cells
+  paths.cost <- transition(paths.clip, cost.fun.path, 8, symm=FALSE)
+  adj <- adjacent(paths.cost, cells=1:ncell(paths.cost), pairs=TRUE, directions=8)
+  paths.cost[adj] <- cost.to.connectance.inv(x=paths.cost[adj])
+  
+    #################
+  #   
+  #  Combine
+  #
+  #################
+  
+  #combined cost of travel 
+  comb <-   paths.cost * vf.cost 
+
+  #correct for distance between cells
+  comb<-geoCorrection(comb, scl=F)
+  
+  return(comb)
+  
+}
+
+#calculates the conductance surface
+getConductance_full <- function(){
+  
+  ###################
+  #
+  # Elevation
+  #
+  #################
+  
+  hd <- transition(r,heightDiff,8,symm=FALSE)
+  slope <- geoCorrection(hd, scl=FALSE)
+  adj <- adjacent(r, cells=1:ncell(r), pairs=TRUE, directions=8)
+  vf.cost <- slope
+  vf.cost[adj] <- vert.factor.slope(x=slope[adj])
+  vf.cost[adj] <- cost.to.connectance.inv(x=vf.cost[adj])
+  
+  #############
+  #
+  # Paths
+  #
+  #############
+  
+  #calculate mean conductance between cells based on path/non-path of cells
+  paths.cost <- transition(paths, cost.fun.path, 8, symm=FALSE)
+  adj <- adjacent(paths.cost, cells=1:ncell(paths.cost), pairs=TRUE, directions=8)
+  paths.cost[adj] <- cost.to.connectance.inv(x=paths.cost[adj])
+  
+    #################
+  #   
+  #  Combine
+  #
+  #################
+  
+  #combined cost of travel 
+  comb <-   paths.cost * vf.cost 
+
+  #correct for distance between cells
+  comb<-geoCorrection(comb, scl=F)
+  
+  
+  return(comb)
+  
+  
+  
+}
+
+
+###################
+#
+# Functions used to simulate movement
+#
+#################
+
+
+#main function controling the simulation
+simulate.abm<-function(x){
+  out.sim.final <- data.frame(x=-1, y=-1, total_cost=-1, total_dist=-1 ,madeit=-1,rowID=-1,rep=-1)
+  for(rowV in x){
+    
+    #get start and end points
+    start = c(df.start.end.coords[rowV,]$Start.x,df.start.end.coords[rowV,]$Start.y)
+    end   = c(df.start.end.coords[rowV,]$End.x,df.start.end.coords[rowV,]$End.y)
+    
+    #get conductance surface
+    costSurf_sub <- getConductance_reduced(start, end)
+    
+    for(rep in  1: sim.replicates){
+      
+      #sim
+      df.temp <- simulate.random.path(start, end,costSurf_sub,rowV,rep)
+      
+      #record
+      out.sim.final<-rbind(out.sim.final,df.temp)
+    }
+    
+    print(paste0("stepped ",rowV))
+    
+  }
+  if(nrow(out.sim.final)>1)out.sim.final<-out.sim.final[-1,]
+  return(out.sim.final)
+}
+
+
+#function for calculating agent path
+simulate.random.path <- function(start, end, costSurf,x,rep){
+  
+  #Agent variables
+  total_dist = 0
+  total_cost = 0
+  current_position = c(start[1],start[2])
+  madeit = 0
+  
+  #inialize a dataframe
+  out.sim.final <- data.frame(x=current_position[1], y=current_position[2], total_cost=total_cost, total_dist=total_dist ,madeit=madeit,rowID=x,rep=rep)
+  
+  #simulate steps
+  for(i in 1:sim.steps){
+    
+    #make a move
+    #calculate neighbouring points
+    step.results <- calculate.next.move(current_position, costSurf = costSurf)
+    
+    #update agent
+    total_cost <- total_cost + step.results[[2]]
+    total_dist <- total_dist + (((step.results[[1]][1]-current_position[1])^2) + ((step.results[[1]][2]-current_position[2])^2))^0.5
+    current_position <- step.results[[1]]
+    
+    #check to see if the agent reached the end
+    if(calculate.distance.betw.points(current_position,end) < min.threshold ){
+      
+      madeit=1
+      
+      #make the last step
+      step.results <- calculate.final.move(current_position, end , costSurf = costSurf)
+    
+      #update agent
+      total_cost <- total_cost + step.results[[2]]
+      total_dist <- total_dist + (((step.results[[1]][1]-current_position[1])^2) + ((step.results[[1]][2]-current_position[2])^2))^0.5
+      current_position <- step.results[[1]]
+      
+      #record each step
+      out.sim.final <- data.frame(x=current_position[1], y=current_position[2], total_cost=total_cost, total_dist=total_dist ,madeit=madeit,rowID=x,rep=rep)
+      
+      #end the simulation
+      break
+      
+    } 
+    
+    #record each step
+    out.sim.final <- rbind(out.sim.final,data.frame(x=current_position[1], y=current_position[2], total_cost=total_cost, total_dist=total_dist ,madeit=madeit,rowID=x,rep=rep))
+    
+  }
+  
+  #after all steps, record the results
+  if(madeit==0){
+    #out.sim.final <- data.frame(x=start[1], y=start[2], total_cost=total_cost, total_dist=total_dist ,madeit=0)
+  }
+  
+  return(out.sim.final)
+  
+}
+
+
+#####calculate potential local paths within a visual radius, and choose the best one.
+calculate.next.move <- function (currentCell, costSurf){
+  
+  #calculate neighbouring points
+  random.points <- raster::adjacent(costSurf, cellFromXY(costSurf,xy=c((currentCell)[1],  (currentCell)[2]) ) ,directions=8)
+  random.points<-t(apply( as.matrix(random.points[,2]) , 1,get_xy,r=costSurf ))
+  
+  #calculate the path cost of each local option
+  random.points.cost <- apply(random.points,1,calculate.cost.of.route, start=currentCell, costSurf=costSurf)
+  chosenIndex <- sample(1:nrow(random.points), prob=1/random.points.cost, size =1)
+
+  #return new updated start location and the cost to tavel to it
+  return(list(random.points[chosenIndex,],random.points.cost[chosenIndex]) )
+  
+}
+
+#####calculate the final path to the end point.
+calculate.final.move <- function (currentCell,end, costSurf){
+  
+  #calculate the path cost of each local option
+  end.points.cost <- costDistance(x=costSurf, fromCoords=currentCell, toCoords=t(as.matrix(end)) )
+  
+  #return new updated start location and the cost to tavel to it
+  return(list(end,end.points.cost) )
+  
+}
+
+
+get_xy <- function(x, r){
+  xyFromCell(r,x)  
+}
+
+calculate.points.x.meters.away <- function(start, x, vision){
+  return(c(start[1]+cos(x)*vision,start[2]+sin(x)*vision))
+  
+}
+
+calculate.cost.of.route <- function(x, start,costSurf){
+  return(costDistance(x=costSurf, fromCoords=start, toCoords=x))
+} 
+
+
+calculate.distance.betw.points <- function(x,p2){
+  return((((x[1]-p2[1])^2) + ((x[2]-p2[2])^2) )^0.5)
+}
+
+
+```
+
+
+#### 3) run the ABM
+
+Choose parameters for the ABM (all parameters for the ABM will be placed here).
+```{r}
+#df.start.end.coords <- read.csv("StartEnd_Coords.csv")
+#df.start.end.coords<-df.start.end.coords[,1:6]
+
+min.threshold = 45     #when has the agent reached the end point
+sim.replicates = 100   #How many simulated replicates to run
+sim.steps = 122        #How many steps does the agent take (maximum)
+
+```
+
+
+Run the abm in paralle
+```{r}
+
+#Create the clusters
+cl <- makeCluster(10)  
+registerDoParallel(cl)
+
+#Export the environment variables to each cluster
+clusterExport(cl,ls())
+
+#Load the library "rgeos" to each cluster
+clusterEvalQ(cl, library(rgeos))
+clusterEvalQ(cl, library(raster))
+clusterEvalQ(cl, library(gdistance))
+
+#Split the data
+ID.Split<-clusterSplit(cl,1:nrow(df.start.end.coords)) #
+
+#Run the function in each cluster
+system.time(m<-clusterApply(cl, x=ID.Split, fun=simulate.abm)) #ID.Split
+
+#Cluster close
+stopCluster(cl)
+
+#Merge the results
+output<- do.call("rbind", m)
+
+#output the results to a csv file
+write.csv(output, file="SimpathCosts.csv")
+```
+
+
+#### 4) Look at the outputs
+
+Plot results
+```{r}
+results1 <-output
+
+#create unique id column
+results1$unID <- paste0(results1$rowID,"_", results1$rep)
+
+#summarise the chance of making it for each rowID 
+results1.summarised <- results1 %>% group_by(unID) %>% summarise(madeit.final = max(madeit), rowID=max(rowID), distanceTraveled = max(total_dist), costTotal = max(total_cost))
+results1.chance <- results1.summarised %>% group_by(rowID) %>% summarise(chance = sum(madeit.final)/n(), )  
+
+#Add rowID to the observed start/end coordinates
+df.start.end.coords.join <- df.start.end.coords 
+df.start.end.coords.join$rowID <- seq(1:nrow(df.start.end.coords.join)) 
+
+#bind the observed and the simulated dataframes
+results2<-left_join(results1.chance,df.start.end.coords.join, by="rowID")
+
+#create unique id
+results2$ID = paste0(round(results2$Start.x),"_",round(results2$Start.y)," ",round(results2$End.x),"_",round(results2$End.y))
+
+#take a look
+ggplot(results2, aes(x=reorder(factor(ID), chance), y=chance)) + geom_point() + theme_classic() + theme(axis.text.x = element_blank()) + geom_hline(yintercept=0.5, linetype = "dashed") + labs(y="Probability of reaching the end point", x="Travel segment")
+```
+
+
+
